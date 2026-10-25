@@ -229,7 +229,7 @@ def call_opendota_endpoint(endpoint_path: str, query_params: dict[str, Any] | No
         _last_request_time = time.monotonic()
 
     url = f"{OPENDOTA_API_BASE}{endpoint_path}"
-    headers = {"User-Agent": "RoasterLens-AI-Esports-Scout/1.0"}
+    headers = {"User-Agent": "RoasterLens-AI-Esports-Scout/1.0", "Accept-Encoding": "gzip, deflate"}
     params = dict(query_params) if query_params else {}
     if os.getenv("OPENDOTA_API_KEY"):
         params["api_key"] = os.environ["OPENDOTA_API_KEY"]

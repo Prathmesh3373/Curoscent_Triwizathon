@@ -28,8 +28,12 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from backend.agent_graph import build_graph, create_resilient_gemini_model, normalize_model_name
+from backend.intelligence_api import router as intelligence_router, register_investigation, _investigations
+from backend.text_utils import extract_clean_text
 
-load_dotenv()
+import pathlib
+env_path = pathlib.Path(__file__).resolve().parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 app = FastAPI(
     title="RoasterLens — Esports Scouting & Multi-Roster Intelligence API",
@@ -38,6 +42,8 @@ app = FastAPI(
 )
 
 # Enable CORS for frontend development servers (React, Next.js, Vite, etc.)
+app.include_router(intelligence_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -259,8 +265,9 @@ async def chat_sync(body: ChatRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(502, f"Scouting Pipeline execution failed: {exc}") from exc
 
-    final_report = result.get("final_report", "")
+    final_report = extract_clean_text(result.get("final_report", ""))
     audit_trail = result.get("audit_trail", [])
+    investigation_trace = result.get("investigation_trace", [])
     phase = result.get("phase", "completed")
 
     # Record assistant message in session
@@ -272,6 +279,15 @@ async def chat_sync(body: ChatRequest) -> dict[str, Any]:
     })
     _session_registry[session_id]["latest_phase"] = phase
     _session_registry[session_id]["audit_trail"].extend(audit_trail)
+
+    inv_record = register_investigation(
+        session_id=session_id,
+        query=body.message,
+        intent=result.get("intent", {}),
+        final_report=final_report,
+        audit_trail=audit_trail,
+        investigation_trace=investigation_trace
+    )
 
     return {
         "status": "success",
@@ -286,6 +302,8 @@ async def chat_sync(body: ChatRequest) -> dict[str, Any]:
         "counter_scout_challenge": result.get("counter_scout_challenge"),
         "final_report": final_report,
         "audit_trail": audit_trail,
+        "investigation_trace": investigation_trace,
+        "candidates": inv_record.get("candidates", []),
         "model": model_name
     }
 
@@ -329,6 +347,7 @@ async def chat_stream(body: ChatRequest):
 
         final_report = ""
         full_audit_trail: list[dict[str, Any]] = []
+        full_investigation_trace: list[dict[str, Any]] = []
         last_phase = "initialized"
         accumulated_state: dict[str, Any] = {}
 
@@ -352,6 +371,8 @@ async def chat_stream(body: ChatRequest):
                     last_phase = node_output.get("phase", node_name)
                     audit_items = node_output.get("audit_trail", [])
                     full_audit_trail.extend(audit_items)
+                    trace_items = node_output.get("investigation_trace", [])
+                    full_investigation_trace.extend(trace_items)
 
                     # Extract node-specific details for UI display
                     node_summary: dict[str, Any] = {}
@@ -368,9 +389,9 @@ async def chat_stream(body: ChatRequest):
                     elif node_name == "counter_scout_challenge":
                         node_summary = {"preview": (node_output.get("counter_scout_challenge") or "")[:200] + "..."}
                     elif node_name in {"final_evaluation", "ask_user"}:
-                        final_report = node_output.get("final_report", "")
+                        final_report = extract_clean_text(node_output.get("final_report", ""))
 
-                    # 2. Emit Step Update for Left Sidebar Progress & Status Bar
+                    # 2. Emit Step Update with real tool explanations & decision trace
                     yield {
                         "event": "step_update",
                         "data": json.dumps({
@@ -379,9 +400,20 @@ async def chat_stream(body: ChatRequest):
                             "progress": progress,
                             "timestamp": _utc_now(),
                             "summary": node_summary,
-                            "audit_events": audit_items
+                            "audit_events": audit_items,
+                            "trace_events": trace_items
                         })
                     }
+
+            # Register investigation into persistent shared model with real shortlisted candidates and decision trace
+            inv_record = register_investigation(
+                session_id=session_id,
+                query=body.message,
+                intent=accumulated_state.get("intent", {}),
+                final_report=extract_clean_text(final_report or accumulated_state.get("final_report", "")),
+                audit_trail=full_audit_trail,
+                investigation_trace=full_investigation_trace
+            )
 
             # 3. Final Result Event for Right Screen
             yield {
@@ -389,10 +421,12 @@ async def chat_stream(body: ChatRequest):
                 "data": json.dumps({
                     "session_id": session_id,
                     "turn_id": turn_id,
-                    "final_report": final_report or accumulated_state.get("final_report", ""),
+                    "final_report": extract_clean_text(final_report or accumulated_state.get("final_report", "")),
                     "phase": last_phase,
                     "needs_clarification": accumulated_state.get("needs_clarification", False),
                     "audit_trail": full_audit_trail,
+                    "investigation_trace": full_investigation_trace,
+                    "candidates": inv_record.get("candidates", []),
                     "completed_at": _utc_now()
                 })
             }
@@ -400,7 +434,7 @@ async def chat_stream(body: ChatRequest):
             # Store in session registry
             _session_registry[session_id]["messages"].append({
                 "role": "assistant",
-                "content": final_report or accumulated_state.get("final_report", ""),
+                "content": extract_clean_text(final_report or accumulated_state.get("final_report", "")),
                 "timestamp": _utc_now(),
                 "phase": last_phase
             })
