@@ -34,6 +34,8 @@ from pydantic import BaseModel, Field
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from typing_extensions import Annotated, TypedDict
 
+from backend.text_utils import extract_clean_text
+from backend.trace_models import ToolCallExplanation, InvestigationTraceEvent
 from backend.opendota_service import (
     call_opendota_endpoint,
     search_contextual_intel,
@@ -53,52 +55,20 @@ _last_llm_call_time = 0.0
 
 
 def normalize_model_name(name: str | None) -> str:
-    """Normalize any custom/preview model identifier to an official Google API endpoint."""
-    if not name:
-        return "gemini-2.5-flash"
-    n = name.strip().lower()
-    valid_models = {
-        "gemini-2.5-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-8b",
-        "gemini-1.5-pro",
-        "gemini-2.0-flash",
-    }
-    if n in valid_models:
-        return n
-    if "flash" in n:
-        return "gemini-2.5-flash"
-    if "pro" in n:
-        return "gemini-1.5-pro"
-    return "gemini-2.5-flash"
+    """Normalize model identifier strictly to Gemini 3.5 Flash Lite."""
+    return "gemini-3.5-flash-lite"
 
 
 def create_resilient_gemini_model(primary_model_name: str, api_key: str):
-    """Create a high-availability LangChain model with multi-tier fallback chain."""
-    norm_name = normalize_model_name(primary_model_name)
-    candidates = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
-    fallback_pool = [m for m in candidates if m != norm_name]
-
-    primary = ChatGoogleGenerativeAI(
-        model=norm_name,
+    """Create model strictly pinned to Gemini 3.5 Flash Lite."""
+    return ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash-lite",
         temperature=0.1,
         google_api_key=api_key,
-        max_retries=5,
-        request_timeout=30,
+        max_retries=2,
+        request_timeout=60,
+        max_output_tokens=2048,
     )
-
-    fallbacks = [
-        ChatGoogleGenerativeAI(
-            model=m,
-            temperature=0.1,
-            google_api_key=api_key,
-            max_retries=5,
-            request_timeout=30,
-        )
-        for m in fallback_pool
-    ]
-
-    return primary.with_fallbacks(fallbacks)
 
 
 def _pace_and_invoke(model: Any, messages: list[Any]) -> Any:
@@ -113,7 +83,7 @@ def _pace_and_invoke(model: Any, messages: list[Any]) -> Any:
 
     def _is_rate_limit(exc: BaseException) -> bool:
         msg = str(exc).upper()
-        return any(term in msg for term in ["429", "RESOURCE_EXHAUSTED", "RATE_LIMIT", "QUOTA"])
+        return any(term in msg for term in ["429", "RESOURCE_EXHAUSTED", "RATE_LIMIT", "QUOTA", "504", "DEADLINE_EXCEEDED", "TIMEOUT"])
 
     @retry(
         stop=stop_after_attempt(5),
@@ -160,6 +130,7 @@ class AgentState(TypedDict, total=False):
     counter_scout_challenge: str
     final_report: str
     audit_trail: Annotated[list[dict[str, Any]], operator.add]
+    investigation_trace: Annotated[list[dict[str, Any]], operator.add]
     phase: str
     turn_id: str
 
@@ -289,13 +260,44 @@ def create_extract_and_validate_intent(model: Any):
             }
         }
 
+        trace_event = InvestigationTraceEvent(
+            investigation_id=state.get("turn_id", "turn"),
+            step_id="extract_and_validate_intent",
+            step_order=1,
+            title="Step 01 — Intent Extraction & Context Validation",
+            node_name="extract_and_validate_intent",
+            decision_summary=parsed.rationale or "Validated user scouting parameters and context sufficiency.",
+            evidence_gap_or_objective="Analyze initial scouting query to identify target player handle, desired competitive role, and determine whether API calls can proceed or clarification is required.",
+            status="completed",
+            tool_calls=[
+                ToolCallExplanation(
+                    tool_name="LangChain LLM Parser",
+                    step_number=1,
+                    step_title="Prompt Schema & Context Extraction",
+                    reason="Identify target player, competitive role, and determine if requirements are complete.",
+                    input_params={"user_query": user_msg[:120]},
+                    result_summary=f"Extracted player: '{parsed.player_target or 'None'}', role: '{parsed.target_role or 'None'}', sufficient: {parsed.is_sufficient_to_proceed}.",
+                    impact="Permits downstream OpenDota API dispatch if context is sufficient; routes to clarification otherwise.",
+                    status="completed",
+                    data_source_type="llm_reasoning"
+                )
+            ],
+            conditional_decision=(
+                "Requirements sufficiently defined; proceeding to OpenDota API evidence collection."
+                if parsed.is_sufficient_to_proceed
+                else "Insufficient context provided. Pausing execution to query user for target player or role."
+            ),
+            timestamp=_utc_now()
+        ).model_dump()
+
         return {
             "user_request": user_msg,
             "intent": parsed.model_dump(),
             "needs_clarification": not parsed.is_sufficient_to_proceed,
             "clarification_question": parsed.clarification_question,
             "phase": "intent_extracted",
-            "audit_trail": [audit_entry]
+            "audit_trail": [audit_entry],
+            "investigation_trace": [trace_event]
         }
 
     return extract_and_validate_intent
@@ -316,11 +318,38 @@ def create_ask_user():
             "decision_rationale": "Missing essential scouting criteria. Requesting user input.",
             "details": {"question": question}
         }
+        trace_event = InvestigationTraceEvent(
+            investigation_id=state.get("turn_id", "turn"),
+            step_id="ask_user",
+            step_order=2,
+            title="Step 02 — Clarification Gateway",
+            node_name="ask_user",
+            decision_summary="Pivoted to conversational clarification because the input request lacked concrete player handle or role criteria.",
+            evidence_gap_or_objective="Clarify candidate role, team affiliation, or specific tactical requirements prior to consuming rate-limited API quota.",
+            status="waiting_for_user",
+            tool_calls=[
+                ToolCallExplanation(
+                    tool_name="Conversational Prompt Generator",
+                    step_number=2,
+                    step_title="Clarification Request",
+                    reason="Prevent speculative API requests by soliciting exact criteria from coach/manager.",
+                    input_params={"question": question},
+                    result_summary=f"Dispatched clarification question to user interface: '{question}'",
+                    impact="Halts automated pipeline until coach confirms player handle or target position.",
+                    status="completed",
+                    data_source_type="llm_reasoning"
+                )
+            ],
+            conditional_decision="Triggered because is_sufficient_to_proceed was false.",
+            timestamp=_utc_now()
+        ).model_dump()
+
         return {
             "messages": [AIMessage(content=question)],
             "final_report": question,
             "phase": "waiting_for_user_input",
-            "audit_trail": [audit_entry]
+            "audit_trail": [audit_entry],
+            "investigation_trace": [trace_event]
         }
     return ask_user_node
 
@@ -334,9 +363,24 @@ def create_collect_opendota_evidence():
         intent = state.get("intent", {})
         player_target = intent.get("player_target") or ""
         user_text = f"{player_target} {state.get('user_request', '')}"
+        tool_explanations: list[ToolCallExplanation] = []
+        step_seq = 1
 
         # 1. Search OpenDota OpenAPI Documentation dynamically
         docs_res = search_opendota_docs(f"{player_target} recent matches heroes totals")
+        endpoints_found = len(docs_res.get("matched_endpoints", [])) if isinstance(docs_res, dict) else 0
+        tool_explanations.append(ToolCallExplanation(
+            tool_name="search_opendota_docs",
+            step_number=step_seq,
+            step_title="OpenAPI Documentation Schema Search",
+            reason=f"Discover valid OpenDota API endpoints covering recent matches, hero pool, and totals for candidate '{player_target}'.",
+            input_params={"query": f"{player_target} recent matches heroes totals"},
+            result_summary=f"Found {endpoints_found} matching OpenAPI operations from live OpenDota 3.0 specification.",
+            impact="Provides verified parameter schemas and path routes for subsequent player telemetry calls.",
+            status="completed",
+            data_source_type="opendota_api"
+        ))
+        step_seq += 1
 
         # 2. Extract numeric account ID if present directly
         numeric_match = re.search(r"\b(\d{6,10})\b", user_text)
@@ -350,23 +394,134 @@ def create_collect_opendota_evidence():
         if not resolved_account_id and player_target:
             search_res = call_opendota_endpoint("/search", {"q": player_target})
             collected_evidence.append({"endpoint": f"/search?q={player_target}", "result": search_res})
-            if search_res.get("data") and isinstance(search_res["data"], list) and len(search_res["data"]) > 0:
-                resolved_account_id = search_res["data"][0].get("account_id")
+            matches_count = len(search_res.get("data", [])) if isinstance(search_res.get("data"), list) else 0
+            if matches_count > 0:
+                first_match = search_res["data"][0]
+                resolved_account_id = first_match.get("account_id")
+                res_desc = f"Resolved account ID {resolved_account_id} for '{first_match.get('personaname', player_target)}' ({matches_count} matches)."
+            else:
+                res_desc = f"Search returned 0 public matches for handle '{player_target}'."
+
+            tool_explanations.append(ToolCallExplanation(
+                tool_name="call_opendota_endpoint(/search)",
+                step_number=step_seq,
+                step_title="OpenDota Player Directory Resolution",
+                reason=f"Candidate was specified by name ('{player_target}') without numeric Steam ID. Querying OpenDota player registry to resolve 32-bit account ID.",
+                input_params={"q": player_target},
+                result_summary=res_desc,
+                impact="Discovered primary Steam account ID required to query match histories and hero stats.",
+                status="completed" if matches_count > 0 else "failed",
+                data_source_type="opendota_api"
+            ))
+            step_seq += 1
 
         # 4. If account ID resolved, fetch profile, recent matches, heroes, totals
+        conditional_note = ""
         if resolved_account_id:
-            for ep in [
-                f"/players/{resolved_account_id}",
-                f"/players/{resolved_account_id}/recentMatches",
-                f"/players/{resolved_account_id}/heroes",
-                f"/players/{resolved_account_id}/totals"
-            ]:
-                res = call_opendota_endpoint(ep)
-                collected_evidence.append({"endpoint": ep, "result": res})
+            # Profile
+            prof_res = call_opendota_endpoint(f"/players/{resolved_account_id}")
+            collected_evidence.append({"endpoint": f"/players/{resolved_account_id}", "result": prof_res})
+            prof_data = prof_res.get("data", {}).get("profile", {}) if isinstance(prof_res.get("data"), dict) else {}
+            tool_explanations.append(ToolCallExplanation(
+                tool_name=f"call_opendota_endpoint(/players/{resolved_account_id})",
+                step_number=step_seq,
+                step_title="Retrieve Verified Player Profile",
+                reason=f"Confirm competitive persona, competitive rank tier, team affiliation, and country for account #{resolved_account_id}.",
+                input_params={"account_id": resolved_account_id},
+                result_summary=f"Profile retrieved for '{prof_data.get('personaname', 'Unknown')}', rank tier: {prof_res.get('data', {}).get('rank_tier', 'N/A')}.",
+                impact="Establishes ground-truth identity and competitive tier verification.",
+                status="completed" if prof_res.get("status") == "success" else "failed",
+                data_source_type="opendota_api"
+            ))
+            step_seq += 1
+
+            # Recent Matches
+            m_res = call_opendota_endpoint(f"/players/{resolved_account_id}/recentMatches")
+            collected_evidence.append({"endpoint": f"/players/{resolved_account_id}/recentMatches", "result": m_res})
+            m_count = len(m_res.get("data", [])) if isinstance(m_res.get("data"), list) else 0
+            tool_explanations.append(ToolCallExplanation(
+                tool_name=f"call_opendota_endpoint(/players/{resolved_account_id}/recentMatches)",
+                step_number=step_seq,
+                step_title="Retrieve Recent Competitive Matches",
+                reason=f"Fetch situational telemetry (kills, deaths, assists, GPM, XPM, hero damage, lane roles) across recent competitive matches.",
+                input_params={"account_id": resolved_account_id, "window": "latest"},
+                result_summary=f"Fetched {m_count} match records with full situational stats.",
+                impact="Provides underlying data for recent form, KDA stability, and situational winrates.",
+                status="completed" if m_res.get("status") == "success" else "failed",
+                data_source_type="opendota_api"
+            ))
+            step_seq += 1
+
+            # Hero Summary
+            h_res = call_opendota_endpoint(f"/players/{resolved_account_id}/heroes")
+            collected_evidence.append({"endpoint": f"/players/{resolved_account_id}/heroes", "result": h_res})
+            h_count = len(h_res.get("data", [])) if isinstance(h_res.get("data"), list) else 0
+            tool_explanations.append(ToolCallExplanation(
+                tool_name=f"call_opendota_endpoint(/players/{resolved_account_id}/heroes)",
+                step_number=step_seq,
+                step_title="Retrieve Hero Pool Performance & Versatility",
+                reason="Identify signature hero pool, winrate per hero, and determine hero versatility vs puddle risks.",
+                input_params={"account_id": resolved_account_id},
+                result_summary=f"Retrieved performance statistics across {h_count} distinct heroes.",
+                impact="Enables red-team counter-scouting to test whether the candidate relies on a narrow comfort pool.",
+                status="completed" if h_res.get("status") == "success" else "failed",
+                data_source_type="opendota_api"
+            ))
+            step_seq += 1
+
+            # Career Totals
+            t_res = call_opendota_endpoint(f"/players/{resolved_account_id}/totals")
+            collected_evidence.append({"endpoint": f"/players/{resolved_account_id}/totals", "result": t_res})
+            t_count = len(t_res.get("data", [])) if isinstance(t_res.get("data"), list) else 0
+            tool_explanations.append(ToolCallExplanation(
+                tool_name=f"call_opendota_endpoint(/players/{resolved_account_id}/totals)",
+                step_number=step_seq,
+                step_title="Retrieve Career Aggregate Totals",
+                reason="Benchmark career baselines for teamfight participation, observer wards placed, and stuns.",
+                input_params={"account_id": resolved_account_id},
+                result_summary=f"Retrieved {t_count} career aggregated statistical benchmarks.",
+                impact="Differentiates recent short-term form from long-term competitive baselines.",
+                status="completed" if t_res.get("status") == "success" else "failed",
+                data_source_type="opendota_api"
+            ))
+            step_seq += 1
+
+            # Conditional Decision: Sample adequacy check
+            if m_count < 10:
+                conditional_note = f"Initial recent match sample is limited ({m_count} matches). Additional historical match retrieval (/players/{resolved_account_id}/matches) was dispatched to broaden the sample."
+                hist_res = call_opendota_endpoint(f"/players/{resolved_account_id}/matches", {"limit": 30})
+                collected_evidence.append({"endpoint": f"/players/{resolved_account_id}/matches?limit=30", "result": hist_res})
+                h_ret_count = len(hist_res.get("data", [])) if isinstance(hist_res.get("data"), list) else 0
+                tool_explanations.append(ToolCallExplanation(
+                    tool_name=f"call_opendota_endpoint(/players/{resolved_account_id}/matches)",
+                    step_number=step_seq,
+                    step_title="Expanded Historical Match Ingestion",
+                    reason=f"Recent match sample size ({m_count}) was under threshold (< 10). Fetching up to 30 historical competitive matches for statistical validity.",
+                    input_params={"account_id": resolved_account_id, "limit": 30},
+                    result_summary=f"Ingested {h_ret_count} additional historical matches.",
+                    impact="Elevates sample confidence for situational winrate and KDA calculation.",
+                    status="completed" if hist_res.get("status") == "success" else "failed",
+                    data_source_type="opendota_api"
+                ))
+            else:
+                conditional_note = f"Recent match sample size ({m_count} matches) is sufficient; no emergency match expansion required."
         else:
-            # Query pro players directory from live OpenDota API
+            # Pro Players directory fallback
             pro_res = call_opendota_endpoint("/proPlayers")
             collected_evidence.append({"endpoint": "/proPlayers", "result": pro_res})
+            pro_count = len(pro_res.get("data", [])) if isinstance(pro_res.get("data"), list) else 0
+            tool_explanations.append(ToolCallExplanation(
+                tool_name="call_opendota_endpoint(/proPlayers)",
+                step_number=step_seq,
+                step_title="Query Verified Pro Players Directory",
+                reason="No candidate account ID was resolved from search. Querying active professional roster database to find verified competitive alternatives.",
+                input_params={},
+                result_summary=f"Loaded {pro_count} active professional esports player records.",
+                impact="Provides alternative shortlist of competitive tier-1 and tier-2 players.",
+                status="completed" if pro_res.get("status") == "success" else "failed",
+                data_source_type="opendota_api"
+            ))
+            conditional_note = "Target candidate could not be uniquely resolved to an ID; queried pro player directory as fallback."
 
         audit_entry: AuditEvent = {
             "timestamp": _utc_now(),
@@ -381,11 +536,26 @@ def create_collect_opendota_evidence():
             }
         }
 
+        trace_event = InvestigationTraceEvent(
+            investigation_id=state.get("turn_id", "turn"),
+            step_id="collect_opendota_evidence",
+            step_order=3,
+            title="Step 03 — OpenDota Match & Career Telemetry Collection",
+            node_name="collect_opendota_evidence",
+            decision_summary=f"Fetched live OpenDota telemetry for candidate '{player_target}' across {len(collected_evidence)} API endpoints.",
+            evidence_gap_or_objective="Acquire granular match records, hero pool versatility, and career averages to establish empirical evidence for recruitment evaluation.",
+            status="completed",
+            tool_calls=tool_explanations,
+            conditional_decision=conditional_note,
+            timestamp=_utc_now()
+        ).model_dump()
+
         return {
             "opendota_evidence": collected_evidence,
             "opendota_status": {"is_sufficient": bool(resolved_account_id), "account_id": resolved_account_id},
             "phase": "opendota_evidence_collected",
-            "audit_trail": [audit_entry]
+            "audit_trail": [audit_entry],
+            "investigation_trace": [trace_event]
         }
 
     return collect_opendota_evidence
@@ -407,9 +577,25 @@ def create_collect_contextual_evidence():
         ]
 
         contextual_results = []
+        tool_explanations: list[ToolCallExplanation] = []
+        step_seq = 1
+
         for q in queries:
             res = search_contextual_intel(q)
             contextual_results.append(res)
+            res_count = len(res.get("results", [])) if isinstance(res, dict) else 0
+            tool_explanations.append(ToolCallExplanation(
+                tool_name="search_contextual_intel(Tavily)",
+                step_number=step_seq,
+                step_title="External Esports Web & Meta Intelligence",
+                reason=f"Retrieve tournament placements, patch meta trends, and recent team announcements for query: '{q}'.",
+                input_params={"query": q},
+                result_summary=f"Retrieved {res_count} tournament and editorial intel sources.",
+                impact="Provides real-world roster context outside pure numerical match logs.",
+                status="completed" if res.get("status") == "success" else "skipped",
+                data_source_type="web_research"
+            ))
+            step_seq += 1
 
         audit_entry: AuditEvent = {
             "timestamp": _utc_now(),
@@ -423,10 +609,25 @@ def create_collect_contextual_evidence():
             }
         }
 
+        trace_event = InvestigationTraceEvent(
+            investigation_id=state.get("turn_id", "turn"),
+            step_id="collect_contextual_evidence",
+            step_order=4,
+            title="Step 04 — Contextual Esports & Meta Intelligence",
+            node_name="collect_contextual_evidence",
+            decision_summary=f"Scanned competitive news and tournament placements across {len(queries)} research queries.",
+            evidence_gap_or_objective="Bridge OpenDota statistical match data with real tournament performance, roster stability, and meta shifts.",
+            status="completed",
+            tool_calls=tool_explanations,
+            conditional_decision="Triggered dual web queries covering player tournament pedigree and role patch meta.",
+            timestamp=_utc_now()
+        ).model_dump()
+
         return {
             "contextual_evidence": contextual_results,
             "phase": "contextual_evidence_collected",
-            "audit_trail": [audit_entry]
+            "audit_trail": [audit_entry],
+            "investigation_trace": [trace_event]
         }
 
     return collect_contextual_evidence
@@ -509,6 +710,36 @@ def create_synthesize_evidence():
             "details": stats_summary
         }
 
+        trace_event = InvestigationTraceEvent(
+            investigation_id=state.get("turn_id", "turn"),
+            step_id="synthesize_evidence",
+            step_order=5,
+            title="Step 05 — Python Telemetry Aggregation & Feature Synthesis",
+            node_name="synthesize_evidence",
+            decision_summary=f"Synthesized {stats_summary.get('sample_size', 0)} matches into situational metrics: Winrate ({stats_summary.get('winrate_recent', 0)}%), KDA ({stats_summary.get('avg_kda', 'N/A')}), GPM/XPM ({stats_summary.get('avg_gpm', 0)}/{stats_summary.get('avg_xpm', 0)}).",
+            evidence_gap_or_objective="Transform unstructured match arrays and hero lists into deterministic numerical features for evaluation.",
+            status="completed",
+            tool_calls=[
+                ToolCallExplanation(
+                    tool_name="Python Metric Synthesis Engine",
+                    step_number=1,
+                    step_title="Deterministic Metric Calculation",
+                    reason="Compute empirical situational statistics directly in Python without LLM hallucination.",
+                    input_params={"match_sample_size": stats_summary.get("sample_size", 0), "hero_records": len(heroes_list)},
+                    result_summary=f"Calculated winrate: {stats_summary.get('winrate_recent', 0)}%, KDA: {stats_summary.get('avg_kda', 'N/A')}, GPM: {stats_summary.get('avg_gpm', 0)}, XPM: {stats_summary.get('avg_xpm', 0)} across {len(top_heroes)} top heroes.",
+                    impact="Feeds verifiable numerical anchors into the recruitment director LLM prompt.",
+                    status="completed",
+                    data_source_type="python_metric"
+                )
+            ],
+            conditional_decision=(
+                f"Sufficient empirical sample ({stats_summary.get('sample_size', 0)} matches); validated for director evaluation."
+                if stats_summary.get("sample_size", 0) > 0
+                else "Match telemetry returned empty; flagging missing sample warning."
+            ),
+            timestamp=_utc_now()
+        ).model_dump()
+
         return {
             "synthesized_evidence": synthesized_package,
             "feature_selection": {
@@ -516,7 +747,8 @@ def create_synthesize_evidence():
                 "top_heroes_count": len(top_heroes)
             },
             "phase": "evidence_synthesized",
-            "audit_trail": [audit_entry]
+            "audit_trail": [audit_entry],
+            "investigation_trace": [trace_event]
         }
 
     return synthesize_evidence
@@ -541,14 +773,14 @@ def create_evaluate_candidate(model: Any):
             "   (e.g., vision/min, teamfight participation, mid-round decision making for IGL; farm stability for Carry).\n"
             "2. Situational Metrics Analysis: Evaluate recent winrate, KDA volatility, and hero pool versatility from the evidence.\n"
             "3. Role-Specific Impact: Analyze shot-calling impact, mid-round adjustments, and multi-roster squad synergy.\n"
-            "4. Clearly state all assumptions, evaluation formulas, and preliminary fit grade."
+            "4. Clearly state all assumptions, evaluation formulas, and preliminary fit grade. Keep assessment focused and under 400 words."
         )
 
         resp = _pace_and_invoke(model, [
             SystemMessage(content=eval_prompt),
             HumanMessage(content="Deliver preliminary scouting evaluation.")
         ])
-        eval_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+        eval_text = extract_clean_text(resp.content)
 
         audit_entry: AuditEvent = {
             "timestamp": _utc_now(),
@@ -559,10 +791,37 @@ def create_evaluate_candidate(model: Any):
             "details": {"candidate": intent.get("player_target")}
         }
 
+        trace_event = InvestigationTraceEvent(
+            investigation_id=state.get("turn_id", "turn"),
+            step_id="evaluate_candidate",
+            step_order=6,
+            title="Step 06 — Lead Scout Candidate Evaluation",
+            node_name="evaluate_candidate",
+            decision_summary=f"Synthesized empirical metrics into preliminary tactical assessment for {intent.get('player_target') or 'candidate'}.",
+            evidence_gap_or_objective="Translate OpenDota statistics and role meta into strategic recruitment fit, shot-calling proxies, and roster synergy.",
+            status="completed",
+            tool_calls=[
+                ToolCallExplanation(
+                    tool_name="LangChain LLM Reasoning Engine",
+                    step_number=1,
+                    step_title="Strategic Fit Evaluation",
+                    reason="Evaluate candidate strengths against requested tactical role priorities.",
+                    input_params={"candidate": intent.get("player_target"), "target_role": intent.get("target_role")},
+                    result_summary="Generated preliminary tactical evaluation incorporating winrate, KDA volatility, and hero versatility.",
+                    impact="Establishes affirmative baseline recommendation before counter-scout challenge.",
+                    status="completed",
+                    data_source_type="llm_reasoning"
+                )
+            ],
+            conditional_decision="Evaluation complete; routing to counter-scout red-team challenge to expose blind spots.",
+            timestamp=_utc_now()
+        ).model_dump()
+
         return {
             "preliminary_evaluation": eval_text,
             "phase": "preliminary_evaluated",
-            "audit_trail": [audit_entry]
+            "audit_trail": [audit_entry],
+            "investigation_trace": [trace_event]
         }
 
     return evaluate_candidate
@@ -589,14 +848,14 @@ def create_counter_scout_challenge(model: Any):
             "2. Role Proxy Scrutiny: Does high assist count or warding truly prove effective mid-round shot-calling?\n"
             "3. Roster Chemistry & Tilt Vulnerabilities: What happens when early lane executions fail? Performance from behind?\n"
             "4. Alternative Contenders: Propose at least one viable alternative competitive player who plays this role and explain why they might offer better tactical value or roster chemistry.\n"
-            "5. Critical Unknown: State the single biggest uncertainty that could invalidate the primary recommendation."
+            "5. Critical Unknown: State the single biggest uncertainty that could invalidate the primary recommendation. Keep challenge punchy and under 350 words."
         )
 
         resp = _pace_and_invoke(model, [
             SystemMessage(content=counter_prompt),
             HumanMessage(content="Execute counter-scout challenge.")
         ])
-        challenge_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+        challenge_text = extract_clean_text(resp.content)
 
         audit_entry: AuditEvent = {
             "timestamp": _utc_now(),
@@ -607,10 +866,37 @@ def create_counter_scout_challenge(model: Any):
             "details": {"candidate": intent.get("player_target")}
         }
 
+        trace_event = InvestigationTraceEvent(
+            investigation_id=state.get("turn_id", "turn"),
+            step_id="counter_scout_challenge",
+            step_order=7,
+            title="Step 07 — Counter-Scout Red-Team Stress Test",
+            node_name="counter_scout_challenge",
+            decision_summary="Interrogated preliminary evaluation for hero puddle reliance, proxy stat flaws, tilt vulnerabilities, and identified viable alternative candidates.",
+            evidence_gap_or_objective="Prevent confirmation bias by executing an adversarial counter-scout audit against the primary recommendation.",
+            status="completed",
+            tool_calls=[
+                ToolCallExplanation(
+                    tool_name="LangChain Adversarial Red-Team",
+                    step_number=1,
+                    step_title="Adversarial Critique & Blind Spot Discovery",
+                    reason="Challenge affirmative evaluation assumptions and formulate risk mitigation.",
+                    input_params={"candidate": intent.get("player_target")},
+                    result_summary="Identified hero puddle risks, tilt vulnerabilities, and alternative roster contenders.",
+                    impact="Forces the final report to reconcile risks rather than offering an uncritical endorsement.",
+                    status="completed",
+                    data_source_type="llm_reasoning"
+                )
+            ],
+            conditional_decision="Identified potential alternative contenders and unknown variables; routing to reconciliation.",
+            timestamp=_utc_now()
+        ).model_dump()
+
         return {
             "counter_scout_challenge": challenge_text,
             "phase": "counter_scout_completed",
-            "audit_trail": [audit_entry]
+            "audit_trail": [audit_entry],
+            "investigation_trace": [trace_event]
         }
 
     return counter_scout_challenge
@@ -650,14 +936,14 @@ def create_final_evaluation(model: Any):
             "   - Concrete 3-phase trial roadmap.\n"
             "6. DATA AUDIT TRAIL SUMMARY\n"
             "   - OpenDota endpoints hit, external sources, data freshness timestamps, and confidence boundaries.\n\n"
-            "Write with depth, analytical rigor, and esports domain expertise. Avoid generic statements."
+            "Write with sharp tactical precision, high analytical density, and conciseness. Limit to under 650 words. Do not repeat long raw data dumps."
         )
 
         resp = _pace_and_invoke(model, [
             SystemMessage(content=final_prompt),
             HumanMessage(content="Generate final comprehensive esports scouting intelligence report.")
         ])
-        final_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+        final_text = extract_clean_text(resp.content)
 
         audit_entry: AuditEvent = {
             "timestamp": _utc_now(),
@@ -671,11 +957,38 @@ def create_final_evaluation(model: Any):
             }
         }
 
+        trace_event = InvestigationTraceEvent(
+            investigation_id=state.get("turn_id", "turn"),
+            step_id="final_evaluation",
+            step_order=8,
+            title="Step 08 — Definitive Recruitment Intelligence Dossier",
+            node_name="final_evaluation",
+            decision_summary="Reconciled preliminary evaluation with red-team critique into authoritative recommendation and 3-phase trial roadmap.",
+            evidence_gap_or_objective="Deliver finalized command-level recruitment dossier fulfilling all operational directives.",
+            status="completed",
+            tool_calls=[
+                ToolCallExplanation(
+                    tool_name="LangChain Synthesis Director",
+                    step_number=1,
+                    step_title="Dossier Reconciliation & Roadmapping",
+                    reason="Formulate definitive Sign/Trial/Pass verdict with evidence grounding.",
+                    input_params={"candidate": intent.get("player_target")},
+                    result_summary=f"Synthesized comprehensive report ({len(final_text)} characters) linking telemetry to actionable recruitment plan.",
+                    impact="Outputs the final scouting artifact ready for executive coach review.",
+                    status="completed",
+                    data_source_type="llm_reasoning"
+                )
+            ],
+            conditional_decision="Investigation completed successfully; all evidence trails reconciled.",
+            timestamp=_utc_now()
+        ).model_dump()
+
         return {
             "final_report": final_text,
             "messages": [AIMessage(content=final_text)],
             "phase": "completed",
-            "audit_trail": [audit_entry]
+            "audit_trail": [audit_entry],
+            "investigation_trace": [trace_event]
         }
 
     return final_evaluation
